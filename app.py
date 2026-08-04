@@ -11,7 +11,16 @@ class UrlRequest(BaseModel):
 
 class VideoRequest(BaseModel):
     url: str
-    quality: str = "best"
+    format_id: str  # lấy từ danh sách "formats" trả về bởi /info
+
+
+def _base_opts():
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+    }
 
 
 @app.get("/")
@@ -31,39 +40,49 @@ def health():
 
 @app.post("/info")
 def get_info(req: UrlRequest):
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-    }
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(_base_opts()) as ydl:
             info = ydl.extract_info(req.url, download=False)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Không lấy được thông tin: {e}")
+
+    # Chỉ lấy các format PROGRESSIVE: đã có sẵn cả video+audio trong 1 file.
+    # Bỏ format tách riêng (chỉ video hoặc chỉ audio) để tránh trường hợp
+    # người dùng chọn quality nhưng nhận về 2 link phải tự ghép.
+    formats = []
+    seen_heights = set()
+    for f in info.get("formats", []):
+        has_video = f.get("vcodec") not in (None, "none")
+        has_audio = f.get("acodec") not in (None, "none")
+        height = f.get("height")
+
+        if has_video and has_audio and height:
+            if height in seen_heights:
+                continue  # tránh liệt kê trùng cùng 1 độ phân giải nhiều lần
+            seen_heights.add(height)
+            formats.append({
+                "format_id": f.get("format_id"),
+                "label": f"{height}p",
+                "height": height,
+                "ext": f.get("ext"),
+                "filesize": f.get("filesize") or f.get("filesize_approx"),
+            })
+
+    # Sắp xếp giảm dần theo độ phân giải, dễ hiển thị lên dropdown
+    formats.sort(key=lambda x: x["height"], reverse=True)
 
     return {
         "title": info.get("title"),
         "thumbnail": info.get("thumbnail"),
         "duration": info.get("duration"),
+        "formats": formats,  # danh sách quality THẬT có sẵn cho video này
     }
 
 
 @app.post("/video")
 def get_video(req: VideoRequest):
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-    }
-
-    if req.quality and req.quality != "best":
-        height = "".join(filter(str.isdigit, req.quality))
-        opts["format"] = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
-    else:
-        opts["format"] = "best"  # ưu tiên progressive (1 file gộp sẵn) để tránh phải merge 2 link
+    opts = _base_opts()
+    opts["format"] = req.format_id  # dùng đúng format_id user đã chọn từ /info
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -71,10 +90,9 @@ def get_video(req: VideoRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Không lấy được link video: {e}")
 
-    if info.get("requested_formats"):
-        download_url = [f["url"] for f in info["requested_formats"]]
-    else:
-        download_url = info.get("url")
+    # Vì format_id được chọn từ danh sách progressive ở /info,
+    # sẽ không bao giờ rơi vào trường hợp requested_formats (2 link tách rời)
+    download_url = info.get("url")
 
     return {
         "title": info.get("title"),
@@ -84,13 +102,8 @@ def get_video(req: VideoRequest):
 
 @app.post("/audio")
 def get_audio(req: UrlRequest):
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-        "format": "bestaudio/best",
-    }
+    opts = _base_opts()
+    opts["format"] = "bestaudio/best"
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(req.url, download=False)
